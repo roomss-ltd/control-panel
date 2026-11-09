@@ -1,0 +1,271 @@
+package main
+
+import (
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"syscall"
+	"testing"
+	"time"
+)
+
+// fakeOps records every syscall the limiter would make.
+type fakeOps struct {
+	calls []string
+	nice  map[int]int
+	comm  map[int]string
+}
+
+func (f *fakeOps) ops(protected map[int]string) procOps {
+	return procOps{
+		tids: func(pid int) []int { return []int{pid, pid + 1} },
+		affinity: func(tid int, cores []int) error {
+			f.calls = append(f.calls, "aff "+itoa(tid)+" "+joinInts(cores))
+			return nil
+		},
+		nice:    func(tid int) (int, error) { return f.nice[tid], nil },
+		setNice: func(tid, n int) error { f.calls = append(f.calls, "nice "+itoa(tid)+" "+itoa(n)); return nil },
+		ioprio: func(tid int, idle bool) error {
+			f.calls = append(f.calls, "io "+itoa(tid)+" "+map[bool]string{true: "idle", false: "be"}[idle])
+			return nil
+		},
+		signal: func(pid int, s syscall.Signal) error {
+			f.calls = append(f.calls, "sig "+itoa(pid)+" "+map[syscall.Signal]string{syscall.SIGSTOP: "STOP", syscall.SIGCONT: "CONT"}[s])
+			return nil
+		},
+		guard: func(pid int) (touch, pause bool) {
+			switch protected[pid] {
+			case "never":
+				return false, false
+			case "nopause":
+				return true, false
+			}
+			return true, true
+		},
+		comm: func(pid int) string { return f.comm[pid] },
+	}
+}
+
+func TestLimiterApplyAndRemove(t *testing.T) {
+	f := &fakeOps{nice: map[int]int{100: 0, 101: 0, 200: 12, 201: 12}}
+	l := newLimiter(filepath.Join(t.TempDir(), "limits.json"), 10, f.ops(map[int]string{300: "never", 400: "nopause"}))
+	rule := Limit{Key: "runner:r1", Label: "CI runner r1", Cores: []int{0, 1}, Nice: 10, IOIdle: true, Paused: true}
+	if err := l.set(rule); err != nil {
+		t.Fatal(err)
+	}
+	l.apply(map[string][]int{"runner:r1": {100, 200, 300, 400}, "other": {500}})
+	got := strings.Join(f.calls, "\n")
+	for _, want := range []string{"aff 100 0,1", "aff 101 0,1", "nice 100 10", "nice 101 10", "io 100 idle", "sig 100 STOP", "aff 400 0,1", "sig 200 STOP"} {
+		if !strings.Contains(got, want+"\n") && !strings.HasSuffix(got, want) {
+			t.Errorf("missing %q in\n%s", want, got)
+		}
+	}
+	for _, bad := range []string{"nice 200", " 300 ", "sig 400", " 500 "} {
+		if strings.Contains(got+"\n", bad) {
+			t.Errorf("unexpected %q (nice only goes up; guarded pids untouched)", bad)
+		}
+	}
+	f.calls = nil
+	if err := l.remove("runner:r1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("remove must leave syscalls to the enforcer, got %v", f.calls)
+	}
+	l.apply(map[string][]int{"runner:r1": {100}})
+	if strings.Join(f.calls, "|") != "aff 100 0,1,2,3,4,5,6,7,8,9|io 100 be|aff 101 0,1,2,3,4,5,6,7,8,9|io 101 be|sig 100 CONT" {
+		t.Fatalf("revert calls = %v", f.calls)
+	}
+	if len(l.list()) != 0 {
+		t.Fatalf("rules after remove: %+v", l.list())
+	}
+}
+
+// The CI reserve: everything but CI (and groups with cores of their own) leaves the kept cores while a job runs,
+// the runners get every core, and once CI is idle the kept cores are everyone's again, once.
+func TestCIReserve(t *testing.T) {
+	f := &fakeOps{comm: map[int]string{}}
+	l := newLimiter(filepath.Join(t.TempDir(), "limits.json"), 10, f.ops(nil))
+	for _, r := range []Limit{{Key: restKey, Label: "Everything but CI", Cores: []int{0, 1, 2, 3, 4, 5}}, {Key: "own", Label: "own", Cores: []int{9}}} {
+		if err := l.set(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pass := func(job bool) string {
+		f.calls = nil
+		f.comm[600] = map[bool]string{true: "Runner.Worker", false: "Runner.Listener"}[job]
+		l.apply(map[string][]int{"runner:r1": {600}, "pane:x": {100}, "own": {200}})
+		return strings.Join(f.calls, "|")
+	}
+	all := "0,1,2,3,4,5,6,7,8,9"
+	if got := pass(false); got != "aff 100 "+all+"|aff 101 "+all+"|aff 200 9|aff 201 9" {
+		t.Fatalf("idle after a start: everything gets every core once, own rules hold: %s", got)
+	}
+	if got := pass(false); got != "aff 200 9|aff 201 9" {
+		t.Fatalf("idle again: the reserve leaves everything be: %s", got)
+	}
+	if got := pass(true); got != "aff 600 "+all+"|aff 601 "+all+"|aff 100 0,1,2,3,4,5|aff 101 0,1,2,3,4,5|aff 200 9|aff 201 9" {
+		t.Fatalf("a job runs: %s", got)
+	}
+	if got := pass(false); !strings.HasPrefix(got, "aff 100 "+all+"|aff 101 "+all+"|") {
+		t.Fatalf("the job ended: the kept cores are everyone's again: %s", got)
+	}
+	pass(true)
+	if err := l.remove(restKey); err != nil {
+		t.Fatal(err)
+	}
+	if got := pass(true); got != "aff 100 "+all+"|aff 101 "+all+"|aff 200 9|aff 201 9" {
+		t.Fatalf("reserve removed mid-job: %s", got)
+	}
+	if err := l.set(Limit{Key: restKey, Cores: []int{0}, Nice: 10}); err == nil {
+		t.Fatal("the reserve takes cores only")
+	}
+}
+
+// A group given every core keeps them while a job runs: the reserve passes it by.
+func TestCIReserveExempt(t *testing.T) {
+	f := &fakeOps{comm: map[int]string{600: "Runner.Worker"}}
+	l := newLimiter(filepath.Join(t.TempDir(), "limits.json"), 4, f.ops(nil))
+	for _, r := range []Limit{{Key: restKey, Label: "Everything but CI", Cores: []int{0, 1}}, {Key: "pane:jarvis", Label: "JARVIS", Cores: []int{0, 1, 2, 3}}} {
+		if err := l.set(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l.apply(map[string][]int{"runner:r1": {600}, "pane:x": {100}, "pane:jarvis": {300}})
+	if got := strings.Join(f.calls, "|") + "|"; !strings.Contains(got, "aff 100 0,1|") || !strings.Contains(got, "aff 300 0,1,2,3|") || strings.Contains(got, "aff 300 0,1|") {
+		t.Fatalf("a job runs: the rest on 0,1, JARVIS on every core: %s", got)
+	}
+}
+
+func TestCPUListLen(t *testing.T) {
+	for in, want := range map[string]int{"0-15": 16, "0": 1, "0-3,5,7-9": 10, "": 0, "x": 0, "3-1": 0} {
+		if got := cpuListLen(in); got != want {
+			t.Errorf("cpuListLen(%q) = %d, want %d", in, got, want)
+		}
+	}
+	if n := onlineCPUs(); n < runtime.NumCPU() {
+		t.Errorf("onlineCPUs() = %d, fewer than this process may use (%d)", n, runtime.NumCPU())
+	}
+}
+
+func TestLimiterPersistsRules(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "sub", "limits.json")
+	f := &fakeOps{}
+	l := newLimiter(path, 10, f.ops(nil))
+	if err := l.set(Limit{Key: "qemu-system-x86", Label: "qemu", Cores: []int{6, 7, 8, 9}}); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("limits file: %v %v", fi, err)
+	}
+	again := newLimiter(path, 10, f.ops(nil))
+	if r := again.list(); len(r) != 1 || r[0].Key != "qemu-system-x86" || joinInts(r[0].Cores) != "6,7,8,9" {
+		t.Fatalf("reloaded = %+v", r)
+	}
+}
+
+func TestLimitValidation(t *testing.T) {
+	l := newLimiter(filepath.Join(t.TempDir(), "l.json"), 10, (&fakeOps{}).ops(nil))
+	for _, r := range []Limit{
+		{Key: "", Label: "x"},
+		{Key: "k", Cores: []int{10}},
+		{Key: "k", Cores: []int{-1}},
+		{Key: "k", Cores: []int{1, 1}},
+		{Key: "k", Nice: 5},
+		{Key: "k\x00", Nice: 10},
+		{Key: "k"}, // no limit at all
+	} {
+		if err := l.set(r); err == nil {
+			t.Errorf("accepted %+v", r)
+		}
+	}
+	all := []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}
+	if err := l.set(Limit{Key: "k", Cores: all}); err != nil || joinInts(l.list()[0].Cores) != joinInts(all) {
+		t.Errorf("every core keeps a group off the CI reserve's: %v %+v", err, l.list())
+	}
+	if err := l.set(Limit{Key: restKey, Cores: all}); err == nil {
+		t.Error("a reserve of every core keeps nothing for CI")
+	}
+}
+
+// The real syscalls, on a child we own: affinity, nice, disk priority, pause and resume.
+func TestRealProcOpsOnOwnChild(t *testing.T) {
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Skip("no sleep binary")
+	}
+	defer cmd.Process.Kill()
+	pid := cmd.Process.Pid
+	l := newLimiter(filepath.Join(t.TempDir(), "l.json"), runtime.NumCPU(), realProcOps())
+	if err := l.set(Limit{Key: "k", Cores: []int{0}, Nice: 10, IOIdle: true, Paused: true}); err != nil {
+		t.Fatal(err)
+	}
+	l.apply(map[string][]int{"k": {pid}})
+	status := func() string { b, _ := os.ReadFile("/proc/" + itoa(pid) + "/status"); return string(b) }
+	settle := func(stopped bool) { // signals are delivered asynchronously
+		for i := 0; i < 100 && strings.Contains(status(), "State:\tT") != stopped; i++ {
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	settle(true)
+	if !strings.Contains(status(), "Cpus_allowed_list:\t0\n") {
+		t.Fatalf("affinity not applied:\n%s", status())
+	}
+	if !strings.Contains(status(), "State:\tT") {
+		t.Fatalf("not stopped:\n%s", status())
+	}
+	if n, _ := realProcOps().nice(pid); n != 10 {
+		t.Fatalf("nice = %d", n)
+	}
+	if err := l.remove("k"); err != nil {
+		t.Fatal(err)
+	}
+	l.apply(map[string][]int{"k": {pid}})
+	settle(false)
+	if s := status(); strings.Contains(s, "State:\tT") || strings.Contains(s, "Cpus_allowed_list:\t0\n") {
+		t.Fatalf("not reverted:\n%s", s)
+	}
+}
+
+// Job control: stop the pane's shell before its children and continue it last, or zsh reaps the
+// stop, prints "suspended" and the resumed agent is left in the background (SIGTTIN).
+func TestLimiterSignalsParentsFirstOnStopChildrenFirstOnContinue(t *testing.T) {
+	f := &fakeOps{}
+	l := newLimiter(filepath.Join(t.TempDir(), "l.json"), 10, f.ops(nil))
+	l.set(Limit{Key: "pane:dev-1:3", Label: "p", Paused: true})
+	group := map[string][]int{"pane:dev-1:3": {10, 20, 30}} // pidsByKey order: root first
+	l.apply(group)
+	var sigs []string
+	for _, c := range f.calls {
+		if strings.HasPrefix(c, "sig ") {
+			sigs = append(sigs, c)
+		}
+	}
+	if strings.Join(sigs, "|") != "sig 10 STOP|sig 20 STOP|sig 30 STOP" {
+		t.Fatalf("stop order = %v", sigs)
+	}
+	f.calls = nil
+	l.remove("pane:dev-1:3")
+	l.apply(group)
+	if strings.Join(f.calls, "|") != "sig 30 CONT|sig 20 CONT|sig 10 CONT" {
+		t.Fatalf("continue order = %v", f.calls)
+	}
+}
+
+// Edits inside one enforcer cycle must not lose a pending revert.
+func TestLimiterUndoMerges(t *testing.T) {
+	f := &fakeOps{}
+	l := newLimiter(filepath.Join(t.TempDir(), "l.json"), 10, f.ops(nil))
+	l.set(Limit{Key: "k", Label: "k", Cores: []int{0}, Paused: true})
+	l.apply(map[string][]int{"k": {5}})
+	f.calls = nil
+	l.set(Limit{Key: "k", Label: "k", Cores: []int{0}})    // resume
+	l.set(Limit{Key: "k", Label: "k", Cores: []int{0, 1}}) // new cores before the enforcer ran
+	l.apply(map[string][]int{"k": {5}})
+	if !strings.Contains(strings.Join(f.calls, "|"), "sig 5 CONT") {
+		t.Fatalf("resume lost: %v", f.calls)
+	}
+}

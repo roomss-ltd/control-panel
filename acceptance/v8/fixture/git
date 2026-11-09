@@ -1,0 +1,6 @@
+#!/bin/sh
+# pass-through git that logs every call with its time and working dir (what a GET causes, and where). While
+# $V8QA_E/git-stall exists, every call first sleeps that many seconds (a stalled git must never stall a GET).
+printf '%s\t%s\t%s\n' "$(date +%s.%N)" "$(pwd)" "$*" >> "${V8QA_E:?}/git-calls.log"
+[ -f "$V8QA_E/git-stall" ] && sleep "$(cat "$V8QA_E/git-stall")"
+exec /usr/bin/git "$@"

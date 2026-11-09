@@ -1,0 +1,8 @@
+#!/bin/sh
+# Stand-in `gh` (offline): logs every call. `gh api graphql` for the scratch repo qa8/ledger answers with
+# $V8QA_E/gh-ship.json while $V8QA_E/gh-mode is "ok"; anything else (or mode "fail") fails like gh without network.
+echo "$(date -u +%FT%TZ) $*" >> "${V8QA_E:?}/gh-calls.log"
+if [ "$1 $2" = "api graphql" ] && [ "$(cat "$V8QA_E/gh-mode" 2>/dev/null)" = ok ] && [ -f "$V8QA_E/gh-ship.json" ]; then
+  case " $* " in *" n=ledger "*) cat "$V8QA_E/gh-ship.json"; exit 0;; esac
+fi
+echo "stand-in gh: offline" >&2; exit 1

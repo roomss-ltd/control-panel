@@ -1,0 +1,9 @@
+# the built binary (run-panel.sh builds it on every start)
+/control-panel
+# runtime: pid files, logs, backups
+/run/
+scripts/vendor/node_modules
+# local Cloudflare Access settings (copy panel.env.example)
+/panel.env
+# Python bytecode
+__pycache__/

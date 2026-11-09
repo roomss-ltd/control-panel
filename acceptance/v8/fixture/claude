@@ -1,0 +1,16 @@
+#!/bin/sh
+# Stand-in `claude` on the panel's PATH: logs every call, refuses model runs (no real model spend).
+# A model call (-p) is classified by its prompt so tests can tell the panel's background scheduler (chapters.go
+# chaptersLoop -> chaptersFill / digest.go digestsFill, haiku, 1 min after start then every 4 min) from a call a page
+# or route caused. The prompt is kept in claude-prompts/ as evidence.
+L="${V8QA_E:?}/claude-calls.log"
+case " $* " in *" -p "*|*" --print "*)
+  mkdir -p "$V8QA_E/claude-prompts"; P="$V8QA_E/claude-prompts/$(date -u +%H%M%S)-$$.txt"; cat > "$P"
+  if grep -q '^Below are numbered messages that AI agents sent' "$P"; then K=scheduler:digest
+  elif grep -q 'write one line (at most 14 words)' "$P"; then K=scheduler:chapters
+  else K=other; fi
+  echo "$(date -u +%FT%TZ) kind=$K $*" >> "$L"
+  echo "stand-in claude: model calls are refused in the acceptance suite" >&2; exit 1;;
+esac
+echo "$(date -u +%FT%TZ) kind=nomodel $*" >> "$L"
+exec sleep 3600
